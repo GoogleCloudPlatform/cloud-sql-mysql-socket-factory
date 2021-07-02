@@ -539,6 +539,7 @@ class CloudSqlInstance {
   }
 
   private long secondsUntilRefresh() {
+    // 55 minutes
     Duration refreshBuffer = enableIamAuth ? IAM_AUTH_REFRESH_BUFFER : DEFAULT_REFRESH_BUFFER;
 
     Date expiration = getInstanceData().getExpiration();
