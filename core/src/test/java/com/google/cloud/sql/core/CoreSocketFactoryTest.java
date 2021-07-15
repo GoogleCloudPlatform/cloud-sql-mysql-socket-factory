@@ -31,6 +31,7 @@ import com.google.api.client.googleapis.auth.oauth2.GoogleCredential;
 import com.google.api.client.googleapis.json.GoogleJsonError;
 import com.google.api.client.googleapis.json.GoogleJsonError.ErrorInfo;
 import com.google.api.client.googleapis.json.GoogleJsonResponseException;
+import com.google.api.client.http.HttpBackOffIOExceptionHandler;
 import com.google.api.client.http.HttpRequest;
 import com.google.api.client.http.HttpResponse;
 import com.google.api.client.http.HttpStatusCodes;
@@ -44,6 +45,7 @@ import com.google.api.client.testing.http.HttpTesting;
 import com.google.api.client.testing.http.MockHttpTransport;
 import com.google.api.client.testing.http.MockLowLevelHttpRequest;
 import com.google.api.client.testing.http.MockLowLevelHttpResponse;
+import com.google.api.client.util.ExponentialBackOff;
 import com.google.api.services.sqladmin.SQLAdmin;
 import com.google.api.services.sqladmin.model.DatabaseInstance;
 import com.google.api.services.sqladmin.model.IpMapping;
@@ -123,6 +125,10 @@ public class CoreSocketFactoryTest {
   @Mock
   private GoogleCredential credential;
   @Mock
+  private HttpRequest httpRequest;
+  @Mock
+  private HttpResponse httpResponse;
+  @Mock
   private SQLAdmin adminApi;
   @Mock
   private SQLAdmin.Instances adminApiInstances;
@@ -135,9 +141,73 @@ public class CoreSocketFactoryTest {
 
   private ListenableFuture<KeyPair> clientKeyPair;
 
+  // Creates a fake "accessNotConfigured" exception that can be used for testing.
+  private static GoogleJsonResponseException fakeNotConfiguredException() throws IOException {
+    return fakeGoogleJsonResponseException(
+        HttpStatusCodes.STATUS_CODE_FORBIDDEN,
+        "accessNotConfigured",
+        "Cloud SQL Admin API has not been used in project 12345 before or it is disabled. Enable"
+            + " it by visiting "
+            + " https://console.developers.google.com/apis/api/sqladmin.googleapis.com/overview?project=12345"
+            + " then retry. If you enabled this API recently, wait a few minutes for the action to"
+            + " propagate to our systems and retry.");
+  }
+
+  // Creates a fake "notAuthorized" exception that can be used for testing.
+  private static GoogleJsonResponseException fakeNotAuthorizedException() throws IOException {
+    return fakeGoogleJsonResponseException(
+        HttpStatusCodes.STATUS_CODE_FORBIDDEN,
+        "notAuthorized",
+        "The client is not authorized to make this request");
+  }
+
+  // Builds a fake GoogleJsonResponseException for testing API error handling.
+  private static GoogleJsonResponseException fakeGoogleJsonResponseException(
+      int httpStatus, String reason, String message) throws IOException {
+    ErrorInfo errorInfo = new ErrorInfo();
+    errorInfo.setReason(reason);
+    errorInfo.setMessage(message);
+    return fakeGoogleJsonResponseException(httpStatus, errorInfo, message);
+  }
+
+  private static GoogleJsonResponseException fakeGoogleJsonResponseException(
+      int status, ErrorInfo errorInfo, String message) throws IOException {
+    final JsonFactory jsonFactory = new JacksonFactory();
+    HttpTransport transport =
+        new MockHttpTransport() {
+          @Override
+          public LowLevelHttpRequest buildRequest(String method, String url) throws IOException {
+            errorInfo.setFactory(jsonFactory);
+            GoogleJsonError jsonError = new GoogleJsonError();
+            jsonError.setCode(status);
+            jsonError.setErrors(Collections.singletonList(errorInfo));
+            jsonError.setMessage(message);
+            jsonError.setFactory(jsonFactory);
+            GenericJson errorResponse = new GenericJson();
+            errorResponse.set("error", jsonError);
+            errorResponse.setFactory(jsonFactory);
+            return new MockLowLevelHttpRequest()
+                .setResponse(
+                    new MockLowLevelHttpResponse()
+                        .setContent(errorResponse.toPrettyString())
+                        .setContentType(Json.MEDIA_TYPE)
+                        .setStatusCode(status));
+          }
+        };
+    HttpRequest request =
+        transport.createRequestFactory().buildGetRequest(HttpTesting.SIMPLE_GENERIC_URL);
+    request.setThrowExceptionOnExecuteError(false);
+    HttpResponse response = request.execute();
+    return GoogleJsonResponseException.from(jsonFactory, response);
+  }
+
+  private static byte[] decodeBase64StripWhitespace(String b64) {
+    return Base64.getDecoder().decode(b64.replaceAll("\\s", ""));
+  }
+
   @Before
   public void setup() throws IOException, GeneralSecurityException, ExecutionException {
-    MockitoAnnotations.initMocks(this);
+    MockitoAnnotations.openMocks(this);
 
     KeyFactory keyFactory = KeyFactory.getInstance("RSA");
     PKCS8EncodedKeySpec privateKeySpec =
@@ -174,12 +244,25 @@ public class CoreSocketFactoryTest {
     when(adminApiInstances.get(eq("example.com:myProject"), eq("myRegion~myInstance")))
         .thenReturn(adminApiInstancesGet);
 
+    when(adminApiInstancesGet.buildHttpRequest()).thenReturn(httpRequest);
+    when(httpRequest
+        .setIOExceptionHandler(new HttpBackOffIOExceptionHandler(new ExponentialBackOff())))
+        .thenReturn(httpRequest);
+
     when(adminApi.sslCerts()).thenReturn(adminApiSslCerts);
     when(adminApiSslCerts.createEphemeral(
         anyString(), anyString(), isA(SslCertsCreateEphemeralRequest.class)))
         .thenReturn(adminApiSslCertsCreateEphemeral);
 
-    when(adminApiInstancesGet.execute())
+    when(adminApiInstancesGet.buildHttpRequest()).thenReturn(httpRequest);
+    when(adminApiSslCertsCreateEphemeral.buildHttpRequest()).thenReturn(httpRequest);
+    when(httpRequest
+        .setIOExceptionHandler(new HttpBackOffIOExceptionHandler(new ExponentialBackOff())))
+        .thenReturn(httpRequest);
+    when(adminApiInstancesGet.getResponseClass()).thenReturn(DatabaseInstance.class);
+    when(adminApiSslCertsCreateEphemeral.getResponseClass()).thenReturn(SslCert.class);
+    when(httpRequest.execute()).thenReturn(httpResponse);
+    when(httpResponse.parseAs(adminApiInstancesGet.getResponseClass()))
         .thenReturn(
             new DatabaseInstance()
                 .setBackendType("SECOND_GEN")
@@ -189,7 +272,7 @@ public class CoreSocketFactoryTest {
                         new IpMapping().setIpAddress(PRIVATE_IP).setType("PRIVATE")))
                 .setServerCaCert(new SslCert().setCert(TestKeys.SERVER_CA_CERT))
                 .setRegion("myRegion"));
-    when(adminApiSslCertsCreateEphemeral.execute())
+    when(httpResponse.parseAs(adminApiSslCertsCreateEphemeral.getResponseClass()))
         .thenReturn(new SslCert().setCert(createEphemeralCert(Duration.ofSeconds(0))));
   }
 
@@ -390,66 +473,6 @@ public class CoreSocketFactoryTest {
     }
   }
 
-  // Creates a fake "accessNotConfigured" exception that can be used for testing.
-  private static GoogleJsonResponseException fakeNotConfiguredException() throws IOException {
-    return fakeGoogleJsonResponseException(
-        HttpStatusCodes.STATUS_CODE_FORBIDDEN,
-        "accessNotConfigured",
-        "Cloud SQL Admin API has not been used in project 12345 before or it is disabled. Enable"
-            + " it by visiting "
-            + " https://console.developers.google.com/apis/api/sqladmin.googleapis.com/overview?project=12345"
-            + " then retry. If you enabled this API recently, wait a few minutes for the action to"
-            + " propagate to our systems and retry.");
-  }
-
-  // Creates a fake "notAuthorized" exception that can be used for testing.
-  private static GoogleJsonResponseException fakeNotAuthorizedException() throws IOException {
-    return fakeGoogleJsonResponseException(
-        HttpStatusCodes.STATUS_CODE_FORBIDDEN,
-        "notAuthorized",
-        "The client is not authorized to make this request");
-  }
-
-  // Builds a fake GoogleJsonResponseException for testing API error handling.
-  private static GoogleJsonResponseException fakeGoogleJsonResponseException(
-      int httpStatus, String reason, String message) throws IOException {
-    ErrorInfo errorInfo = new ErrorInfo();
-    errorInfo.setReason(reason);
-    errorInfo.setMessage(message);
-    return fakeGoogleJsonResponseException(httpStatus, errorInfo, message);
-  }
-
-  private static GoogleJsonResponseException fakeGoogleJsonResponseException(
-      int status, ErrorInfo errorInfo, String message) throws IOException {
-    final JsonFactory jsonFactory = new JacksonFactory();
-    HttpTransport transport =
-        new MockHttpTransport() {
-          @Override
-          public LowLevelHttpRequest buildRequest(String method, String url) throws IOException {
-            errorInfo.setFactory(jsonFactory);
-            GoogleJsonError jsonError = new GoogleJsonError();
-            jsonError.setCode(status);
-            jsonError.setErrors(Collections.singletonList(errorInfo));
-            jsonError.setMessage(message);
-            jsonError.setFactory(jsonFactory);
-            GenericJson errorResponse = new GenericJson();
-            errorResponse.set("error", jsonError);
-            errorResponse.setFactory(jsonFactory);
-            return new MockLowLevelHttpRequest()
-                .setResponse(
-                    new MockLowLevelHttpResponse()
-                        .setContent(errorResponse.toPrettyString())
-                        .setContentType(Json.MEDIA_TYPE)
-                        .setStatusCode(status));
-          }
-        };
-    HttpRequest request =
-        transport.createRequestFactory().buildGetRequest(HttpTesting.SIMPLE_GENERIC_URL);
-    request.setThrowExceptionOnExecuteError(false);
-    HttpResponse response = request.execute();
-    return GoogleJsonResponseException.from(jsonFactory, response);
-  }
-
   private String createEphemeralCert(Duration shiftIntoPast)
       throws GeneralSecurityException, ExecutionException, IOException {
     Duration validFor = Duration.ofHours(1);
@@ -485,10 +508,6 @@ public class CoreSocketFactoryTest {
     sb.append("-----END CERTIFICATE-----\n");
 
     return sb.toString();
-  }
-
-  private static byte[] decodeBase64StripWhitespace(String b64) {
-    return Base64.getDecoder().decode(b64.replaceAll("\\s", ""));
   }
 
   private static class FakeSslServer {

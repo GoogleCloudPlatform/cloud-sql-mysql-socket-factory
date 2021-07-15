@@ -19,7 +19,12 @@ package com.google.cloud.sql.core;
 import static com.google.common.base.Preconditions.checkArgument;
 
 import com.google.api.client.googleapis.json.GoogleJsonResponseException;
+import com.google.api.client.http.HttpBackOffIOExceptionHandler;
+import com.google.api.client.http.HttpRequest;
+import com.google.api.client.util.ExponentialBackOff;
 import com.google.api.services.sqladmin.SQLAdmin;
+import com.google.api.services.sqladmin.SQLAdmin.Instances.Get;
+import com.google.api.services.sqladmin.SQLAdmin.SslCerts.CreateEphemeral;
 import com.google.api.services.sqladmin.model.DatabaseInstance;
 import com.google.api.services.sqladmin.model.IpMapping;
 import com.google.api.services.sqladmin.model.SslCert;
@@ -434,8 +439,15 @@ class CloudSqlInstance {
    */
   private Metadata fetchMetadata() {
     try {
-      DatabaseInstance instanceMetadata =
-          apiClient.instances().get(projectId, regionalizedInstanceId).execute();
+      Get getInstanceMetadata =
+          apiClient.instances().get(projectId, regionalizedInstanceId);
+      HttpRequest httpRequest = getInstanceMetadata.buildHttpRequest();
+      // Retry request with backoff if an IOException occurs
+      httpRequest
+          .setIOExceptionHandler(new HttpBackOffIOExceptionHandler(new ExponentialBackOff()));
+
+      DatabaseInstance instanceMetadata = httpRequest.execute()
+          .parseAs(getInstanceMetadata.getResponseClass());
 
       // Validate the instance will support the authenticated connection.
       if (!instanceMetadata.getRegion().equals(regionId)) {
@@ -509,8 +521,15 @@ class CloudSqlInstance {
     }
     SslCert response;
     try {
-      response = apiClient.sslCerts().createEphemeral(projectId, regionalizedInstanceId, request)
-          .execute();
+      CreateEphemeral createEphemeral = apiClient.sslCerts()
+          .createEphemeral(projectId, regionalizedInstanceId, request);
+      // Retry request with backoff if an IOException occurs
+      HttpRequest httpRequest = createEphemeral.buildHttpRequest();
+      httpRequest
+          .setIOExceptionHandler(new HttpBackOffIOExceptionHandler(new ExponentialBackOff()));
+
+      response = httpRequest.execute().parseAs(createEphemeral.getResponseClass());
+
     } catch (IOException ex) {
       throw addExceptionContext(
           ex,
